@@ -13,8 +13,10 @@ mkdir -p "$STATUS_DIR"
 
 TMUX_SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
 [ -z "$TMUX_SESSION" ] && exit 0
+TMUX_WINDOW=$(tmux display-message -p '#{window_index}' 2>/dev/null)
+[ -z "$TMUX_WINDOW" ] && TMUX_WINDOW="0"
 
-echo "done" > "$STATUS_DIR/${TMUX_SESSION}.status"
+echo "done" > "$STATUS_DIR/${TMUX_SESSION}__w${TMUX_WINDOW}.status"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 "$SCRIPT_DIR/../scripts/play-sound.sh" 2>/dev/null &

@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 
-# Find and switch to the next 'done' project
+# Find and switch to the next 'done' or 'wait' window
 
 STATUS_DIR="$HOME/.cache/tmux-agent-status"
 
-# Function to check if an agent is in a session
-has_agent_in_session() {
+# Key helper functions
+key_session() { echo "${1%__w*}"; }
+key_window() { echo "${1##*__w}"; }
+
+has_agent_in_window() {
     local session="$1"
+    local window="$2"
 
     while IFS=: read -r pane_id pane_pid; do
         if pgrep -P "$pane_pid" -f "claude|codex" >/dev/null 2>&1; then
             return 0
         fi
-    done < <(tmux list-panes -t "$session" -F "#{pane_id}:#{pane_pid}" 2>/dev/null)
+    done < <(tmux list-panes -t "$session:$window" -F "#{pane_id}:#{pane_pid}" 2>/dev/null)
 
     return 1
 }
 
-# Function to check if session is SSH
 is_ssh_session() {
     local session="$1"
     if tmux list-panes -t "$session" -F "#{pane_current_command}" 2>/dev/null | grep -q "^ssh$"; then
@@ -29,26 +32,12 @@ is_ssh_session() {
     esac
 }
 
-# Function to get agent status
-normalize_local_wait_status() {
-    local session="$1"
-    local status_file="$STATUS_DIR/${session}.status"
-    local wait_file="$STATUS_DIR/wait/${session}.wait"
-
-    [ ! -f "$status_file" ] && return
-
-    local status
-    status=$(cat "$status_file" 2>/dev/null || echo "")
-    if [ "$status" = "wait" ] && [ ! -f "$wait_file" ]; then
-        echo "done" > "$status_file" 2>/dev/null
-    fi
-}
-
 get_agent_status() {
-    local session="$1"
+    local key="$1"
+    local session
+    session=$(key_session "$key")
 
-    # Check for remote status file first (for SSH sessions)
-    local remote_status="$STATUS_DIR/${session}-remote.status"
+    local remote_status="$STATUS_DIR/${key}-remote.status"
     if [ -f "$remote_status" ] && is_ssh_session "$session"; then
         cat "$remote_status" 2>/dev/null
         return
@@ -56,72 +45,65 @@ get_agent_status() {
         rm -f "$remote_status" 2>/dev/null
     fi
 
-    # Check local status files
-    local status_file="$STATUS_DIR/${session}.status"
+    local status_file="$STATUS_DIR/${key}.status"
     if [ -f "$status_file" ]; then
-        normalize_local_wait_status "$session"
         cat "$status_file" 2>/dev/null || echo ""
     else
         echo ""
     fi
 }
 
-# Get current session
+# Get current session and window
 current_session=$(tmux display-message -p "#{session_name}")
+current_window=$(tmux display-message -p "#{window_index}")
+current_target="${current_session}:${current_window}"
 
-# Check if we're being called with a session to exclude (from wait-session.sh)
-exclude_session="$1"
+# Collect all done windows with their completion times
+done_windows_with_times=()
+while IFS=: read -r name window; do
+    [ -z "$name" ] && continue
+    key="${name}__w${window}"
+    target="${name}:${window}"
 
-# Collect all done sessions with their completion times
-done_sessions_with_times=()
-while IFS=: read -r name windows attached; do
-    # Check if an agent is present
-    agent_status=$(get_agent_status "$name")
+    agent_status=$(get_agent_status "$key")
     has_agent=false
 
-    if has_agent_in_session "$name"; then
+    if has_agent_in_window "$name" "$window"; then
         has_agent=true
     elif [ -n "$agent_status" ] && is_ssh_session "$name"; then
-        # SSH session with remote status
         has_agent=true
     fi
 
-    if [ "$has_agent" = true ]; then
-        [ -z "$agent_status" ] && agent_status="done"
-
-        if [ "$agent_status" = "done" ] && [ "$name" != "$exclude_session" ]; then
-            # Get completion time from status file modification time
-            local status_file=""
-            if is_ssh_session "$name"; then
-                status_file="$STATUS_DIR/${name}-remote.status"
-            else
-                status_file="$STATUS_DIR/${name}.status"
-            fi
-
-            local completion_time=0
-            if [ -f "$status_file" ]; then
-                completion_time=$(stat -c %Y "$status_file" 2>/dev/null || echo 0)
-            fi
-
-            done_sessions_with_times+=("$completion_time:$name")
+    if [ "$has_agent" = true ] && { [ "$agent_status" = "done" ] || [ "$agent_status" = "wait" ] || [ "$agent_status" = "ask" ]; } && [ "$target" != "$current_target" ]; then
+        status_file=""
+        if is_ssh_session "$name"; then
+            status_file="$STATUS_DIR/${key}-remote.status"
+        else
+            status_file="$STATUS_DIR/${key}.status"
         fi
+
+        completion_time=0
+        if [ -f "$status_file" ]; then
+            completion_time=$(stat -f %m "$status_file" 2>/dev/null || stat -c %Y "$status_file" 2>/dev/null || echo 0)
+        fi
+
+        done_windows_with_times+=("$completion_time:$target")
     fi
-done < <(tmux list-sessions -F "#{session_name}:#{session_windows}:#{?session_attached,(attached),}" 2>/dev/null || echo "")
+done < <(tmux list-windows -a -F "#{session_name}:#{window_index}" 2>/dev/null || echo "")
 
-# Sort by completion time (most recent first) and extract session names
-IFS=$'\n' sorted_sessions=($(printf '%s\n' "${done_sessions_with_times[@]}" | sort -t: -k1,1nr | cut -d: -f2-))
-done_sessions=("${sorted_sessions[@]}")
+# Sort by completion time (most recent first) and extract targets
+IFS=$'\n' sorted_windows=($(printf '%s\n' "${done_windows_with_times[@]}" | sort -t: -k1,1nr | cut -d: -f2-))
+done_windows=("${sorted_windows[@]}")
 
-# If no done sessions, exit
-if [ ${#done_sessions[@]} -eq 0 ]; then
-    tmux display-message "No done projects found"
+if [ ${#done_windows[@]} -eq 0 ]; then
+    tmux display-message "No done/waiting projects found"
     exit 0
 fi
 
-# Find current session index in done sessions
+# Find current target index in done windows
 current_index=-1
-for i in "${!done_sessions[@]}"; do
-    if [ "${done_sessions[$i]}" = "$current_session" ]; then
+for i in "${!done_windows[@]}"; do
+    if [ "${done_windows[$i]}" = "$current_target" ]; then
         current_index=$i
         break
     fi
@@ -129,14 +111,11 @@ done
 
 # Calculate next index
 if [ $current_index -eq -1 ]; then
-    # Current session not in done list, switch to most recent done session
-    next_session="${done_sessions[0]}"
+    next_target="${done_windows[0]}"
 else
-    # Switch to next done session (wrap around to most recent after last)
-    next_index=$(( (current_index + 1) % ${#done_sessions[@]} ))
-    next_session="${done_sessions[$next_index]}"
+    next_index=$(( (current_index + 1) % ${#done_windows[@]} ))
+    next_target="${done_windows[$next_index]}"
 fi
 
-# Switch to the next done session
-tmux switch-client -t "$next_session"
-tmux display-message "Switched to next done project: $next_session"
+tmux switch-client -t "$next_target"
+tmux display-message "Switched to: $next_target"

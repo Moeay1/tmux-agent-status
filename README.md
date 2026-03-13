@@ -10,11 +10,11 @@ Real-time status tracking, session switching, and notification sounds for multi-
 
 | Agent | Detection | Status |
 |-------|-----------|--------|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (Anthropic) | Hook-based (4 events) | Stable |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (Anthropic) | Hook-based (5 events) | Stable |
 | [Codex CLI](https://github.com/openai/codex) (OpenAI / ChatGPT) | Process polling + notify | Experimental |
 | Custom (Aider, Cline, Copilot CLI, etc.) | Status files or process polling | Stable |
 
-All agents can run **simultaneously** across tmux sessions, each tracked independently.
+All agents can run **simultaneously** across tmux sessions and windows, each tracked independently at the **window level**.
 
 ## Install
 
@@ -42,12 +42,15 @@ Add hooks to `~/.claude/settings.json`:
     ],
     "Notification": [
       { "hooks": [{ "type": "command", "command": "~/.config/tmux/plugins/tmux-agent-status/hooks/better-hook.sh Notification" }] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [{ "type": "command", "command": "~/.config/tmux/plugins/tmux-agent-status/hooks/better-hook.sh PermissionRequest" }] }
     ]
   }
 }
 ```
 
-Precise agent status via [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks). The AI reports its own state transitions.
+Precise agent status via [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks). The AI reports its own state transitions. **Note:** After modifying hooks, you must restart Claude Code sessions for changes to take effect.
 
 ## OpenAI Codex CLI Setup (Experimental)
 
@@ -67,39 +70,77 @@ When Codex ships proper event hooks, the plugin will upgrade to hook-based track
 
 Integrate any AI coding tool (Aider, Continue, Cursor, Cline, GitHub Copilot CLI, Goose, Amazon Q, Windsurf, or your own agent):
 
-1. **Status files**: Write `working` or `done` to `~/.cache/tmux-agent-status/<session>.status`
+1. **Status files**: Write `working`, `done`, `wait`, or `ask` to `~/.cache/tmux-agent-status/<session>__w<window_index>.status`
 2. **Process polling**: Add your process name to `check_agent_processes()` in `scripts/status-line.sh`
+
+## Agent Statuses
+
+| Status | Icon | Color | Description |
+|--------|------|-------|-------------|
+| `working` | ⚡ | Yellow | Agent is actively working |
+| `wait` | 🔔 | Magenta | Agent is waiting for permission approval (tool use confirmation) |
+| `ask` | 💬 | Cyan | Agent is asking a question (e.g., plan mode, `AskUserQuestion`) |
+| `done` | ✓ | Green | Agent has finished and is ready for input |
+
+Status bar examples:
+- `⚡ agent working` — one agent working
+- `⚡ 2 working 🔔 1 waiting 💬 1 asking ✓ 1 done` — mixed states
+- `✓ All agents ready` — all agents idle
+
+## Window-Level Granularity
+
+Status is tracked per **window**, not per session. Each tmux window with an AI agent is tracked independently using the file naming convention:
+
+```
+~/.cache/tmux-agent-status/<session>__w<window_index>.status
+```
+
+For example, `myproject__w0.status` and `myproject__w2.status` can show different statuses simultaneously. This allows running multiple agents in different windows of the same session.
 
 ## Usage
 
 | Key | Action |
 |-----|--------|
-| `prefix + S` | AI session manager: switcher grouped by agent state |
-| `prefix + N` | Jump to next idle AI session |
-| `prefix + W` | Snooze session (timed wait mode) |
+| `prefix + a` | Window switcher: session-grouped view with agent status |
+| `prefix + N` | Jump to next done/waiting/asking window |
 
-The status bar shows live agent activity:
-- `⚡ agent working` / `⚡ 3 working ✓ 2 done` / `✓ All agents ready`
+### Switcher Controls
+
+The `prefix + a` switcher provides a session-grouped view with live pane preview:
+
+| Key | Action |
+|-----|--------|
+| `h` / `l` | Collapse / expand a session group |
+| `H` / `L` | Collapse / expand all session groups |
+| `Enter` | Switch to selected window |
+| `Ctrl-R` | Reset view |
+
+Sessions open fully expanded by default. The preview panel preserves terminal colors.
 
 ### Keybindings
 
 ```tmux
-set -g @agent-status-key "s"
-set -g @agent-next-done-key "n"
-set -g @agent-wait-key "w"
+set -g @agent-status-key "a"
+set -g @agent-next-done-key "N"
 ```
 
 Old `@claude-*` options still work as fallbacks.
 
 ## Notification Sounds
 
-Plays when an AI agent finishes. Configure:
+Plays when an AI agent finishes or requests permission. Done and wait states have separate sound configurations:
 
 ```tmux
+# Sound when agent finishes (done)
 set -g @agent-notification-sound "chime"
+
+# Sound when agent needs permission approval (wait)
+set -g @agent-wait-sound "alert"
 ```
 
-Options: `chime` (default), `bell`, `fanfare`, `frog`, `speech` ("Agent ready" TTS), `none`.
+**Done sound** options: `chime` (default), `bell`, `fanfare`, `frog`, `speech` ("Agent ready" TTS), `none`.
+
+**Wait sound** options: `alert` (default, Basso on Mac), `bell`, `chime`, `fanfare`, `frog`, `speech`, `none`.
 
 ## Multi-Agent Deploy
 
@@ -124,22 +165,22 @@ Works with GCP, AWS, Azure, Lambda Labs, or any SSH host.
 ## How It Works
 
 ```
-┌─────────────┐     hooks      ┌──────────────────┐
-│ Claude Code  ├──────────────►│                  │
-└─────────────┘                │  ~/.cache/        │     ┌──────────────┐
-                               │  tmux-agent-      ├────►│ tmux status  │
-┌─────────────┐  pgrep/notify  │  status/          │     │ bar (1s poll)│
-│ Codex CLI   ├──────────────►│  <session>.status  │     └──────────────┘
-└─────────────┘                │                  │
-                               │  "working"       │     ┌──────────────┐
-┌─────────────┐  status files  │  "done"          ├────►│ prefix + S   │
-│ Custom agent├──────────────►│  "wait"           │     │ switcher     │
-└─────────────┘                └──────────────────┘     └──────────────┘
+┌─────────────┐     hooks      ┌──────────────────────┐
+│ Claude Code  ├──────────────►│                      │
+└─────────────┘                │  ~/.cache/            │     ┌──────────────┐
+                               │  tmux-agent-          ├────►│ tmux status  │
+┌─────────────┐  pgrep/notify  │  status/              │     │ bar (1s poll)│
+│ Codex CLI   ├──────────────►│  <sess>__w<win>.status │     └──────────────┘
+└─────────────┘                │                      │
+                               │  "working"           │     ┌──────────────┐
+┌─────────────┐  status files  │  "wait" / "ask"      ├────►│ prefix + S   │
+│ Custom agent├──────────────►│  "done"               │     │ switcher     │
+└─────────────┘                └──────────────────────┘     └──────────────┘
 ```
 
-- **Claude Code**: Hook-based. AI agent reports state transitions directly
+- **Claude Code**: Hook-based (5 events). AI agent reports state transitions directly
 - **Codex CLI**: Hybrid. Process polling for "working", `notify` for "done"
-- **Session manager**: Groups sessions by agent state with live preview
+- **Session manager**: Groups windows by session with live color-preserving preview
 
 ## License
 

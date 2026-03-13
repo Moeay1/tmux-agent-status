@@ -3,7 +3,9 @@
 # Shared notification sound player for tmux-agent-status
 # Reads @agent-notification-sound from tmux options and plays the appropriate sound.
 # Falls back to @claude-notification-sound for backwards compatibility.
-# Usage: play-sound.sh [&]
+# Usage: play-sound.sh [wait|done] [&]
+# "wait" uses @agent-wait-sound (default: Basso on Mac, dialog-warning on Linux)
+# "done" or no arg uses @agent-notification-sound (default: chime)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -13,9 +15,16 @@ PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 : "${DISPLAY:=:0}"
 export XDG_RUNTIME_DIR DISPLAY
 
-SOUND_CHOICE=$(tmux show-option -gqv @agent-notification-sound 2>/dev/null)
-[ -z "$SOUND_CHOICE" ] && SOUND_CHOICE=$(tmux show-option -gqv @claude-notification-sound 2>/dev/null)
-: "${SOUND_CHOICE:=chime}"
+SOUND_TYPE="${1:-done}"
+
+if [ "$SOUND_TYPE" = "wait" ]; then
+    SOUND_CHOICE=$(tmux show-option -gqv @agent-wait-sound 2>/dev/null)
+    : "${SOUND_CHOICE:=alert}"
+else
+    SOUND_CHOICE=$(tmux show-option -gqv @agent-notification-sound 2>/dev/null)
+    [ -z "$SOUND_CHOICE" ] && SOUND_CHOICE=$(tmux show-option -gqv @claude-notification-sound 2>/dev/null)
+    : "${SOUND_CHOICE:=chime}"
+fi
 
 case "$SOUND_CHOICE" in
     none)
@@ -26,6 +35,10 @@ esac
 # Map choice to sound files
 # Bundled sounds live in $PLUGIN_DIR/sounds/; system sounds used as fallback
 case "$SOUND_CHOICE" in
+    alert)
+        LINUX_SOUND="/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
+        MAC_SOUND="Basso.aiff"
+        ;;
     speech)
         BUNDLED_SOUND="$PLUGIN_DIR/sounds/speech.wav"
         LINUX_SOUND=""

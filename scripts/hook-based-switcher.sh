@@ -1,69 +1,53 @@
 #!/usr/bin/env bash
 
-# Hook-based session switcher that reads status from files
+# Hook-based window switcher that reads status from files
+# Grouped by session with h/l to collapse/expand
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATUS_DIR="$HOME/.cache/tmux-agent-status"
+STATE_FILE="$STATUS_DIR/.switcher-expanded"
 
-# Function to check if an agent (Claude or Codex) is in a session
-has_agent_in_session() {
+# Key helper functions
+key_session() { echo "${1%__w*}"; }
+key_window() { echo "${1##*__w}"; }
+
+has_agent_in_window() {
     local session="$1"
+    local window="$2"
 
-    # Check all panes in the session for agent processes
     while IFS=: read -r pane_id pane_pid; do
         if pgrep -P "$pane_pid" -f "claude|codex" >/dev/null 2>&1; then
-            return 0  # Found agent process
+            return 0
         fi
-    done < <(tmux list-panes -t "$session" -F "#{pane_id}:#{pane_pid}" 2>/dev/null)
+    done < <(tmux list-panes -t "$session:$window" -F "#{pane_id}:#{pane_pid}" 2>/dev/null)
 
-    return 1  # No agent process found
+    return 1
 }
 
-# Function to check if session is SSH by examining panes
 is_ssh_session() {
     local session="$1"
-    # Check if any pane in the session is running SSH
     if tmux list-panes -t "$session" -F "#{pane_current_command}" 2>/dev/null | grep -q "^ssh$"; then
         return 0
     fi
-    # Simple fallback: check if session name matches known SSH hosts
     case "$session" in
         reachgpu) return 0 ;;
         *) return 1 ;;
     esac
 }
 
-
-# Function to get SSH host for session
 get_ssh_host() {
     local session="$1"
-    # For now, if it's an SSH session, assume the session name is the host
-    # This is simple and works for most cases where session names match SSH config
     if is_ssh_session "$session"; then
         echo "$session"
     fi
 }
 
-# Function to get agent status from hook files
-normalize_local_wait_status() {
-    local session="$1"
-    local status_file="$STATUS_DIR/${session}.status"
-    local wait_file="$STATUS_DIR/wait/${session}.wait"
-
-    [ ! -f "$status_file" ] && return
-
-    local status
-    status=$(cat "$status_file" 2>/dev/null || echo "")
-    if [ "$status" = "wait" ] && [ ! -f "$wait_file" ]; then
-        echo "done" > "$status_file" 2>/dev/null
-    fi
-}
-
 get_agent_status() {
-    local session="$1"
+    local key="$1"
+    local session
+    session=$(key_session "$key")
 
-    # Check for remote status file first (for SSH sessions)
-    local remote_status="$STATUS_DIR/${session}-remote.status"
+    local remote_status="$STATUS_DIR/${key}-remote.status"
     if [ -f "$remote_status" ] && is_ssh_session "$session"; then
         cat "$remote_status" 2>/dev/null
         return
@@ -71,218 +55,288 @@ get_agent_status() {
         rm -f "$remote_status" 2>/dev/null
     fi
 
-    # Check local status files
-    local status_file="$STATUS_DIR/${session}.status"
+    local status_file="$STATUS_DIR/${key}.status"
     if [ -f "$status_file" ]; then
-        normalize_local_wait_status "$session"
         cat "$status_file" 2>/dev/null || echo ""
     else
         echo ""
     fi
 }
 
-# Get all sessions with formatted output
-get_sessions_with_status() {
-    local working_sessions=()
-    local done_sessions=()
-    local wait_sessions=()
-    local no_agent_sessions=()
+is_session_expanded() {
+    local session="$1"
+    [ -f "$STATE_FILE" ] && grep -qxF "$session" "$STATE_FILE" 2>/dev/null
+}
 
-    # Collect all sessions into arrays
-    while IFS=: read -r name windows attached; do
-        local formatted_line=""
+# Truncate and pad string to exact display width (handles CJK chars)
+truncate_pad() {
+    local str="$1"
+    local max="${2:-16}"
+    python3 -c "
+import unicodedata,sys
+s=sys.argv[1]; m=int(sys.argv[2]); w=0; r=''
+for c in s:
+    cw=2 if unicodedata.east_asian_width(c) in ('W','F') else 1
+    if w+cw>m:
+        r+='…'; w+=1; break
+    r+=c; w+=cw
+print(r+' '*(m-w))
+" "$str" "$max" 2>/dev/null || printf "%-${max}s" "${str:0:$max}"
+}
 
-        # Check if it's an SSH session
-        local ssh_indicator=""
-        if is_ssh_session "$name"; then
-            ssh_indicator="[ssh]"
-        fi
+format_status_badge() {
+    local status="$1"
+    case "$status" in
+        working) printf '\033[1;33m⚡working\033[0m' ;;
+        wait)    printf '\033[1;35m🔔 wait\033[0m' ;;
+        ask)     printf '\033[1;36m💬 asking\033[0m' ;;
+        done)    printf '\033[1;32m✓ done\033[0m' ;;
+        *)       printf '\033[1;90mno agent\033[0m' ;;
+    esac
+}
 
-        # Check if an agent is present (local) or if we have remote status (SSH)
-        local agent_status=$(get_agent_status "$name")
+# Build the grouped list using temp files (bash 3.2 compatible)
+get_grouped_list() {
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap "rm -rf '$tmp_dir'" RETURN
+
+    # Format: session\twindow\twin_name\tpanes\tattached\teffective_status
+    while IFS=$'\t' read -r name window win_name panes attached; do
+        [ -z "$name" ] && continue
+        local key="${name}__w${window}"
+
+        local agent_status=$(get_agent_status "$key")
         local has_agent=false
 
-        if has_agent_in_session "$name"; then
+        if has_agent_in_window "$name" "$window"; then
             has_agent=true
         elif [ -n "$agent_status" ] && is_ssh_session "$name"; then
-            # SSH session with remote status
             has_agent=true
         else
-            # Clean up stale status file if no agent is running
             if [ -n "$agent_status" ] && ! is_ssh_session "$name"; then
-                rm -f "$STATUS_DIR/${name}.status" 2>/dev/null
+                rm -f "$STATUS_DIR/${key}.status" 2>/dev/null
+                agent_status=""
             fi
         fi
 
+        local effective_status=""
         if [ "$has_agent" = true ]; then
-            # Default to "done" if no status file exists
             [ -z "$agent_status" ] && agent_status="done"
-
-            if [ "$agent_status" = "working" ]; then
-                if [ -n "$ssh_indicator" ]; then
-                    formatted_line=$(printf "%-20s %2s windows %-12s %s [working]" "$name" "$windows" "$attached" "$ssh_indicator")
-                else
-                    formatted_line=$(printf "%-20s %2s windows %-12s [working]" "$name" "$windows" "$attached")
-                fi
-                working_sessions+=("$formatted_line")
-            elif [ "$agent_status" = "wait" ]; then
-                # Calculate remaining wait time
-                local wait_file="$STATUS_DIR/wait/${name}.wait"
-                local wait_info=""
-                if [ -f "$wait_file" ]; then
-                    local expiry_time=$(cat "$wait_file" 2>/dev/null)
-                    local current_time=$(date +%s)
-                    local remaining=$(( expiry_time - current_time ))
-                    if [ "$remaining" -gt 0 ]; then
-                        local remaining_minutes=$(( remaining / 60 ))
-                        wait_info="(${remaining_minutes}m)"
-                    fi
-                fi
-                if [ -n "$ssh_indicator" ]; then
-                    formatted_line=$(printf "%-20s %2s windows %-12s %s [wait] %s" "$name" "$windows" "$attached" "$ssh_indicator" "$wait_info")
-                else
-                    formatted_line=$(printf "%-20s %2s windows %-12s [wait] %s" "$name" "$windows" "$attached" "$wait_info")
-                fi
-                wait_sessions+=("$formatted_line")
-            else
-                if [ -n "$ssh_indicator" ]; then
-                    formatted_line=$(printf "%-20s %2s windows %-12s %s [done]" "$name" "$windows" "$attached" "$ssh_indicator")
-                else
-                    formatted_line=$(printf "%-20s %2s windows %-12s [done]" "$name" "$windows" "$attached")
-                fi
-                done_sessions+=("$formatted_line")
-            fi
-        else
-            if [ -n "$ssh_indicator" ]; then
-                formatted_line=$(printf "%-20s %2s windows %-12s %s [no agent]" "$name" "$windows" "$attached" "$ssh_indicator")
-            else
-                formatted_line=$(printf "%-20s %2s windows %-12s [no agent]" "$name" "$windows" "$attached")
-            fi
-            no_agent_sessions+=("$formatted_line")
+            effective_status="$agent_status"
         fi
-    done < <(tmux list-sessions -F "#{session_name}:#{session_windows}:#{?session_attached,(attached),}" 2>/dev/null || echo "")
 
-    # Output grouped sessions with separators
+        win_name_safe="${win_name//|/-}"
+        echo "${name}|${window}|${win_name_safe}|${panes}|${attached}|${effective_status}" >> "$tmp_dir/windows"
+    done < <(tmux list-windows -a -F "#{session_name}	#{window_index}	#{window_name}	#{window_panes}	#{?session_attached,(attached),}" 2>/dev/null || echo "")
 
-    # Working sessions
-    if [ ${#working_sessions[@]} -gt 0 ]; then
-        echo -e "\033[1;33m WORKING \033[0m"
-        printf '%s\n' "${working_sessions[@]}"
-    fi
+    [ ! -f "$tmp_dir/windows" ] && return
 
-    # Done sessions
-    if [ ${#done_sessions[@]} -gt 0 ]; then
-        [ ${#working_sessions[@]} -gt 0 ] && echo
-        echo -e "\033[1;32m DONE \033[0m"
-        printf '%s\n' "${done_sessions[@]}"
-    fi
+    # Sort sessions: those with agents first, then those without
+    awk -F'|' '!seen[$1]++ {print $1}' "$tmp_dir/windows" > "$tmp_dir/all_sessions"
+    > "$tmp_dir/has_agent"
+    > "$tmp_dir/no_agent"
+    while IFS= read -r _sess; do
+        if awk -F'|' "\$1==\"$_sess\" && \$6!=\"\"" "$tmp_dir/windows" | grep -q .; then
+            echo "$_sess" >> "$tmp_dir/has_agent"
+        else
+            echo "$_sess" >> "$tmp_dir/no_agent"
+        fi
+    done < "$tmp_dir/all_sessions"
+    cat "$tmp_dir/has_agent" "$tmp_dir/no_agent" > "$tmp_dir/sessions"
 
-    # Wait sessions
-    if [ ${#wait_sessions[@]} -gt 0 ]; then
-        [ ${#working_sessions[@]} -gt 0 ] || [ ${#done_sessions[@]} -gt 0 ] && echo
-        echo -e "\033[1;36m WAIT \033[0m"
-        printf '%s\n' "${wait_sessions[@]}"
-    fi
+    while IFS= read -r session; do
+        [ -z "$session" ] && continue
 
-    # No agent sessions
-    if [ ${#no_agent_sessions[@]} -gt 0 ]; then
-        [ ${#working_sessions[@]} -gt 0 ] || [ ${#done_sessions[@]} -gt 0 ] || [ ${#wait_sessions[@]} -gt 0 ] && echo
-        echo -e "\033[1;90m NO AGENT \033[0m"
-        printf '%s\n' "${no_agent_sessions[@]}"
-    fi
+        grep "^${session}|" "$tmp_dir/windows" > "$tmp_dir/cur_windows"
+        local win_count=$(wc -l < "$tmp_dir/cur_windows" | tr -d ' ')
+
+        # Count statuses
+        local s_working=0 s_wait=0 s_ask=0 s_done=0
+        while IFS='|' read -r _ _ _ _ _ _st; do
+            case "$_st" in
+                working) s_working=$((s_working + 1)) ;;
+                wait)    s_wait=$((s_wait + 1)) ;;
+                ask)     s_ask=$((s_ask + 1)) ;;
+                done)    s_done=$((s_done + 1)) ;;
+            esac
+        done < "$tmp_dir/cur_windows"
+
+        local first_attached=$(head -1 "$tmp_dir/cur_windows" | cut -d'|' -f5)
+        local ssh_label=""
+        is_ssh_session "$session" && ssh_label=" [ssh]"
+
+        if [ "$win_count" -eq 1 ]; then
+            IFS='|' read -r _s _w _wn _p _att _st < "$tmp_dir/cur_windows"
+            local pane_label="${_p} pane"
+            [ "$_p" -gt 1 ] && pane_label="${_p} panes"
+            local badge=$(format_status_badge "$_st")
+            local trunc_wn=$(truncate_pad "$_wn" 18)
+            printf "  \033[1m%-18s\033[0m  %s  %-10s%s  %b\n" "${session}:${_w}" "$trunc_wn" "$_att" "$ssh_label" "$badge"
+        else
+            local expanded=false
+            is_session_expanded "$session" && expanded=true
+
+            local summary=""
+            [ "$s_working" -gt 0 ] && summary="${summary}\033[1;33m⚡${s_working}\033[0m "
+            [ "$s_wait" -gt 0 ] && summary="${summary}\033[1;35m🔔${s_wait}\033[0m "
+            [ "$s_ask" -gt 0 ] && summary="${summary}\033[1;36m💬${s_ask}\033[0m "
+            [ "$s_done" -gt 0 ] && summary="${summary}\033[1;32m✓${s_done}\033[0m "
+
+            local win_label="${win_count} wins"
+
+            local indicator="▶"
+            $expanded && indicator="▼"
+
+            printf "\033[1m%s %s\033[0m  (%s)  %b %s%s\n" "$indicator" "$session" "$win_label" "$summary" "$first_attached" "$ssh_label"
+
+            if $expanded; then
+                while IFS='|' read -r _s _w _wn _p _att _st; do
+                    local pane_label="${_p} pane"
+                    [ "$_p" -gt 1 ] && pane_label="${_p} panes"
+                    local badge=$(format_status_badge "$_st")
+                    local trunc_wn=$(truncate_pad "$_wn" 18)
+                    printf "    \033[0;37m%-18s\033[0m  %s  %b\n" "${session}:${_w}" "$trunc_wn" "$badge"
+                done < "$tmp_dir/cur_windows"
+            fi
+        fi
+    done < "$tmp_dir/sessions"
+
+    echo ""
+    printf "\033[1;36m h/l: collapse/expand | H/L: all | Ctrl-R: reset | Enter: select \033[0m\n"
 }
+
+# Handle --list flag (used by fzf reload)
+if [ "$1" = "--list" ]; then
+    get_grouped_list
+    exit 0
+fi
 
 # Handle --no-fzf flag for daemon refresh
 if [ "$1" = "--no-fzf" ]; then
-    get_sessions_with_status
+    get_grouped_list
+    exit 0
+fi
+
+# Handle --expand <session>
+if [ "$1" = "--expand" ] && [ -n "$2" ]; then
+    mkdir -p "$(dirname "$STATE_FILE")"
+    if ! grep -qxF "$2" "$STATE_FILE" 2>/dev/null; then
+        echo "$2" >> "$STATE_FILE"
+    fi
+    exit 0
+fi
+
+# Handle --collapse <session>
+if [ "$1" = "--collapse" ] && [ -n "$2" ]; then
+    if [ -f "$STATE_FILE" ]; then
+        grep -vxF "$2" "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null
+        mv "$STATE_FILE.tmp" "$STATE_FILE"
+    fi
+    exit 0
+fi
+
+# Handle --expand-all
+if [ "$1" = "--expand-all" ]; then
+    mkdir -p "$(dirname "$STATE_FILE")"
+    tmux list-windows -a -F "#{session_name}" 2>/dev/null | sort | uniq -d > "$STATE_FILE"
+    exit 0
+fi
+
+# Handle --collapse-all
+if [ "$1" = "--collapse-all" ]; then
+    > "$STATE_FILE"
     exit 0
 fi
 
 # Function to perform full reset
 perform_full_reset() {
-    # Stop daemons
     pkill -f "daemon-monitor.sh" 2>/dev/null
     pkill -f "smart-monitor.sh" 2>/dev/null
 
-    # Clear only stale cache files, not active working status
-    # Clear PID files
     find "$STATUS_DIR" -type f -name "*.pid" -delete 2>/dev/null
-
-    # Clear wait files and normalize matching wait statuses back to done
-    for wait_file in "$STATUS_DIR/wait"/*.wait; do
-        [ ! -f "$wait_file" ] && continue
-        session_name=$(basename "$wait_file" .wait)
-        [ -f "$STATUS_DIR/${session_name}.status" ] && echo "done" > "$STATUS_DIR/${session_name}.status" 2>/dev/null
-        [ -f "$STATUS_DIR/${session_name}-remote.status" ] && echo "done" > "$STATUS_DIR/${session_name}-remote.status" 2>/dev/null
-        rm -f "$wait_file" 2>/dev/null
-    done
-
-    # Clear temp files
     rm -f "$STATUS_DIR"/.*.status.tmp 2>/dev/null
 
-    # Check each status file and only remove if no agent is running in that session
     for status_file in "$STATUS_DIR"/*.status; do
         [ ! -f "$status_file" ] && continue
+        local key=$(basename "$status_file" .status)
+        [[ "$key" == *"-remote" ]] && continue
 
-        # Extract session name from filename
-        session_name=$(basename "$status_file" .status)
-
-        # Skip remote status files
-        if [[ "$session_name" == *"-remote" ]]; then
-            continue
-        fi
-
-        # Check if an agent is actually running in this session
-        if [ -f "$STATUS_DIR/wait/${session_name}.wait" ]; then
-            continue
-        fi
-
-        if [ "$(cat "$status_file" 2>/dev/null)" = "wait" ]; then
-            echo "done" > "$status_file" 2>/dev/null
-        fi
-
-        if ! has_agent_in_session "$session_name"; then
-            # No agent running, safe to remove stale status
+        local sess=$(key_session "$key")
+        local win=$(key_window "$key")
+        if ! has_agent_in_window "$sess" "$win"; then
             rm -f "$status_file"
         fi
     done
 
-    # Restart smart-monitor daemon
     "$SCRIPT_DIR/../smart-monitor.sh" stop >/dev/null 2>&1
     "$SCRIPT_DIR/../smart-monitor.sh" start >/dev/null 2>&1
-
-    # Restart daemon monitor
     "$SCRIPT_DIR/daemon-monitor.sh" >/dev/null 2>&1 &
 }
 
 # Handle --reset flag for full reset
 if [ "$1" = "--reset" ]; then
     perform_full_reset
-    get_sessions_with_status
+    get_grouped_list
     exit 0
 fi
 
-# Main
-sessions=$(get_sessions_with_status)
+# Initialize state: start expanded
+tmux list-windows -a -F "#{session_name}" 2>/dev/null | sort | uniq -d > "$STATE_FILE"
 
-# Add the reminder at the bottom of the session list
-sessions_with_reminder=$(echo -e "$(get_sessions_with_status)\n\n\033[1;36m Hit Ctrl-R to clear caches and reset everything! \033[0m")
-
-# Use fzf with manual refresh (Ctrl-R)
-selected=$(echo "$sessions_with_reminder" | fzf \
+# Main: launch fzf
+ME="$0"
+selected=$(get_grouped_list | fzf \
     --ansi \
     --no-sort \
-    --header="Sessions grouped by agent status | j/k: navigate | Enter: select | Esc: cancel | Ctrl-R: full reset" \
-    --preview 'if echo {} | grep -q "━━━\|───"; then echo "Category separator"; else session=$(echo {} | awk "{print \$1}"); tmux capture-pane -pJ -t "$session" 2>/dev/null | cat -s || echo "No preview available"; fi' \
-    --preview-window=right:40% \
-    --prompt="Session> " \
+    --header="h/l: collapse/expand | H/L: all | Enter: select | Ctrl-R: reset" \
+    --preview '
+        line={}
+        target=""
+        clean=$(echo "$line" | sed "s/$(printf "\033")\[[0-9;]*m//g")
+        # Extract session:window pattern from the line
+        target=$(echo "$clean" | grep -oE "[a-zA-Z0-9_-]+:[0-9]+" | head -1)
+        if [ -z "$target" ]; then
+            # Session header line (▶/▼ session): use first window
+            first=$(echo "$clean" | awk "{print \$1}")
+            if [ "$first" = "▶" ] || [ "$first" = "▼" ]; then
+                sess=$(echo "$clean" | awk "{print \$2}")
+                target=$(tmux list-windows -t "$sess" -F "#{session_name}:#{window_index}" 2>/dev/null | head -1)
+            fi
+        fi
+        if [ -n "$target" ]; then
+            tmux capture-pane -e -p -t "$target" 2>/dev/null || echo "No preview available"
+        else
+            echo ""
+        fi
+    ' \
+    --preview-window=right:50% \
+    --prompt="Window> " \
     --bind="j:down,k:up,ctrl-j:preview-down,ctrl-k:preview-up" \
-    --bind="ctrl-r:reload(bash '$0' --reset)" \
+    --bind="ctrl-r:reload(bash '$ME' --reset)" \
+    --bind='l:execute-silent(clean=$(echo {} | sed "s/$(printf "\033")\[[0-9;]*m//g"); first=$(echo "$clean" | awk "{print \$1}"); if [ "$first" = "▶" ]; then sess=$(echo "$clean" | awk "{print \$2}"); bash '"'$ME'"' --expand "$sess"; fi)+reload(bash '"'$ME'"' --list)' \
+    --bind='h:execute-silent(clean=$(echo {} | sed "s/$(printf "\033")\[[0-9;]*m//g"); first=$(echo "$clean" | awk "{print \$1}"); if [ "$first" = "▼" ]; then sess=$(echo "$clean" | awk "{print \$2}"); bash '"'$ME'"' --collapse "$sess"; else t=$(echo "$clean" | awk "{print \$1}"); s=${t%%:*}; bash '"'$ME'"' --collapse "$s"; fi)+reload(bash '"'$ME'"' --list)' \
+    --bind='L:execute-silent(bash '"'$ME'"' --expand-all)+reload(bash '"'$ME'"' --list)' \
+    --bind='H:execute-silent(bash '"'$ME'"' --collapse-all)+reload(bash '"'$ME'"' --list)' \
     --layout=reverse \
     --info=inline)
 
-# Switch to selected session (skip separator lines)
-if [ -n "$selected" ] && ! echo "$selected" | grep -q "━━━\|───"; then
-    session_name=$(echo "$selected" | awk '{print $1}')
-    tmux switch-client -t "$session_name"
+# Clean up state file
+rm -f "$STATE_FILE"
+
+# Switch to selected target
+if [ -n "$selected" ]; then
+    clean=$(echo "$selected" | sed "s/$(printf '\033')\[[0-9;]*m//g")
+    target=$(echo "$clean" | grep -oE '[a-zA-Z0-9_-]+:[0-9]+' | head -1)
+
+    if [ -n "$target" ]; then
+        tmux switch-client -t "$target"
+    else
+        first=$(echo "$clean" | awk '{print $1}')
+        if [ "$first" = "▶" ] || [ "$first" = "▼" ]; then
+            session=$(echo "$clean" | awk '{print $2}')
+            first_win=$(tmux list-windows -t "$session" -F "#{session_name}:#{window_index}" 2>/dev/null | head -1)
+            [ -n "$first_win" ] && tmux switch-client -t "$first_win"
+        fi
+    fi
 fi

@@ -118,4 +118,3 @@ else
 fi
 
 tmux switch-client -t "$next_target"
-tmux display-message "Switched to: $next_target"

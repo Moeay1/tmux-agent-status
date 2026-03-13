@@ -110,12 +110,12 @@ The `prefix + a` switcher provides a session-grouped view with live pane preview
 
 | Key | Action |
 |-----|--------|
-| `h` / `l` | Collapse / expand a session group |
-| `H` / `L` | Collapse / expand all session groups |
+| `Ctrl-J` / `Ctrl-K` | Navigate up / down |
 | `Enter` | Switch to selected window |
 | `Ctrl-R` | Reset view |
+| Type to filter | Search by session/window name |
 
-Sessions open fully expanded by default. The preview panel preserves terminal colors.
+All sessions are fully expanded. The preview panel preserves terminal colors.
 
 ### Keybindings
 
@@ -173,7 +173,7 @@ Works with GCP, AWS, Azure, Lambda Labs, or any SSH host.
 │ Codex CLI   ├──────────────►│  <sess>__w<win>.status │     └──────────────┘
 └─────────────┘                │                      │
                                │  "working"           │     ┌──────────────┐
-┌─────────────┐  status files  │  "wait" / "ask"      ├────►│ prefix + S   │
+┌─────────────┐  status files  │  "wait" / "ask"      ├────►│ prefix + a   │
 │ Custom agent├──────────────►│  "done"               │     │ switcher     │
 └─────────────┘                └──────────────────────┘     └──────────────┘
 ```

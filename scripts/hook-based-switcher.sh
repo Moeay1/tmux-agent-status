@@ -64,24 +64,31 @@ get_agent_status() {
 }
 
 is_session_expanded() {
-    local session="$1"
-    [ -f "$STATE_FILE" ] && grep -qxF "$session" "$STATE_FILE" 2>/dev/null
+    return 0
 }
 
-# Truncate and pad string to exact display width (handles CJK chars)
-truncate_pad() {
-    local str="$1"
-    local max="${2:-16}"
+# Batch truncate: reads lines from stdin, outputs truncated+padded lines
+batch_truncate_pad() {
+    local max="${1:-18}"
     python3 -c "
 import unicodedata,sys
-s=sys.argv[1]; m=int(sys.argv[2]); w=0; r=''
-for c in s:
-    cw=2 if unicodedata.east_asian_width(c) in ('W','F') else 1
-    if w+cw>m:
-        r+='…'; w+=1; break
-    r+=c; w+=cw
-print(r+' '*(m-w))
-" "$str" "$max" 2>/dev/null || printf "%-${max}s" "${str:0:$max}"
+m=int(sys.argv[1])
+for line in sys.stdin:
+    s=line.rstrip('\n'); w=0; r=''
+    for c in s:
+        cw=2 if unicodedata.east_asian_width(c) in ('W','F') else 1
+        if w+cw>m:
+            r+='…'; w+=1; break
+        r+=c; w+=cw
+    print(r+' '*(m-w))
+" "$max" 2>/dev/null
+}
+
+# Single-string truncate (fallback)
+truncate_pad() {
+    local str="$1"
+    local max="${2:-18}"
+    echo "$str" | batch_truncate_pad "$max"
 }
 
 format_status_badge() {
@@ -101,7 +108,51 @@ get_grouped_list() {
     tmp_dir=$(mktemp -d)
     trap "rm -rf '$tmp_dir'" RETURN
 
-    # Format: session\twindow\twin_name\tpanes\tattached\teffective_status
+    # --- Batch: collect all agent PIDs in one pgrep call ---
+    local agent_pids_file="$tmp_dir/agent_pids"
+    pgrep -f "claude|codex" > "$agent_pids_file" 2>/dev/null || true
+
+    # Build pane_pid -> session:window mapping in one tmux call
+    local pane_map_file="$tmp_dir/pane_map"
+    tmux list-panes -a -F "#{pane_pid}|#{session_name}|#{window_index}" > "$pane_map_file" 2>/dev/null || true
+
+    # Find which session:window combos have agents (match agent parent PIDs to pane PIDs)
+    local agent_windows_file="$tmp_dir/agent_windows"
+    > "$agent_windows_file"
+    if [ -s "$agent_pids_file" ]; then
+        # Get parent PIDs of all agent processes, then match against pane PIDs
+        while IFS= read -r apid; do
+            local ppid
+            ppid=$(ps -o ppid= -p "$apid" 2>/dev/null | tr -d ' ')
+            [ -z "$ppid" ] && continue
+            # Walk up the process tree to find a matching pane PID
+            local cur="$ppid"
+            local depth=0
+            while [ -n "$cur" ] && [ "$cur" != "1" ] && [ "$depth" -lt 5 ]; do
+                if grep -q "^${cur}|" "$pane_map_file" 2>/dev/null; then
+                    grep "^${cur}|" "$pane_map_file" | while IFS='|' read -r _ _s _w; do
+                        echo "${_s}__w${_w}"
+                    done >> "$agent_windows_file"
+                    break
+                fi
+                cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+                depth=$((depth + 1))
+            done
+        done < "$agent_pids_file"
+    fi
+
+    # --- Batch: collect SSH sessions ---
+    local ssh_sessions_file="$tmp_dir/ssh_sessions"
+    tmux list-panes -a -F "#{pane_current_command}|#{session_name}" 2>/dev/null | \
+        awk -F'|' '$1=="ssh" {print $2}' | sort -u > "$ssh_sessions_file" 2>/dev/null || true
+    # Add hardcoded SSH sessions
+    echo "reachgpu" >> "$ssh_sessions_file"
+
+    is_ssh_cached() {
+        grep -qxF "$1" "$ssh_sessions_file" 2>/dev/null
+    }
+
+    # --- Build window list ---
     while IFS=$'\t' read -r name window win_name panes attached; do
         [ -z "$name" ] && continue
         local key="${name}__w${window}"
@@ -109,12 +160,12 @@ get_grouped_list() {
         local agent_status=$(get_agent_status "$key")
         local has_agent=false
 
-        if has_agent_in_window "$name" "$window"; then
+        if grep -qxF "$key" "$agent_windows_file" 2>/dev/null; then
             has_agent=true
-        elif [ -n "$agent_status" ] && is_ssh_session "$name"; then
+        elif [ -n "$agent_status" ] && is_ssh_cached "$name"; then
             has_agent=true
         else
-            if [ -n "$agent_status" ] && ! is_ssh_session "$name"; then
+            if [ -n "$agent_status" ] && ! is_ssh_cached "$name"; then
                 rm -f "$STATUS_DIR/${key}.status" 2>/dev/null
                 agent_status=""
             fi
@@ -132,6 +183,10 @@ get_grouped_list() {
 
     [ ! -f "$tmp_dir/windows" ] && return
 
+    # --- Batch: truncate all window names in one python3 call ---
+    local trunc_file="$tmp_dir/truncated"
+    cut -d'|' -f3 "$tmp_dir/windows" | batch_truncate_pad 18 > "$trunc_file"
+
     # Sort sessions: those with agents first, then those without
     awk -F'|' '!seen[$1]++ {print $1}' "$tmp_dir/windows" > "$tmp_dir/all_sessions"
     > "$tmp_dir/has_agent"
@@ -145,33 +200,54 @@ get_grouped_list() {
     done < "$tmp_dir/all_sessions"
     cat "$tmp_dir/has_agent" "$tmp_dir/no_agent" > "$tmp_dir/sessions"
 
+    # Read truncated names into array
+    local -a trunc_names=()
+    while IFS= read -r _tn; do
+        trunc_names+=("$_tn")
+    done < "$trunc_file"
+
+    # Build line-number index for each session in windows file
+    local line_num=0
     while IFS= read -r session; do
         [ -z "$session" ] && continue
 
-        grep "^${session}|" "$tmp_dir/windows" > "$tmp_dir/cur_windows"
-        local win_count=$(wc -l < "$tmp_dir/cur_windows" | tr -d ' ')
+        # Get window lines and their indices
+        local -a cur_lines=()
+        local -a cur_indices=()
+        local i=0
+        while IFS= read -r _line; do
+            local _s=${_line%%|*}
+            if [ "$_s" = "$session" ]; then
+                cur_lines+=("$_line")
+                cur_indices+=("$i")
+            fi
+            i=$((i + 1))
+        done < "$tmp_dir/windows"
+
+        local win_count=${#cur_lines[@]}
 
         # Count statuses
         local s_working=0 s_wait=0 s_ask=0 s_done=0
-        while IFS='|' read -r _ _ _ _ _ _st; do
+        for _line in "${cur_lines[@]}"; do
+            local _st=${_line##*|}
             case "$_st" in
                 working) s_working=$((s_working + 1)) ;;
                 wait)    s_wait=$((s_wait + 1)) ;;
                 ask)     s_ask=$((s_ask + 1)) ;;
                 done)    s_done=$((s_done + 1)) ;;
             esac
-        done < "$tmp_dir/cur_windows"
+        done
 
-        local first_attached=$(head -1 "$tmp_dir/cur_windows" | cut -d'|' -f5)
+        local first_line="${cur_lines[0]}"
+        local first_attached
+        IFS='|' read -r _ _ _ _ first_attached _ <<< "$first_line"
         local ssh_label=""
-        is_ssh_session "$session" && ssh_label=" [ssh]"
+        is_ssh_cached "$session" && ssh_label=" [ssh]"
 
         if [ "$win_count" -eq 1 ]; then
-            IFS='|' read -r _s _w _wn _p _att _st < "$tmp_dir/cur_windows"
-            local pane_label="${_p} pane"
-            [ "$_p" -gt 1 ] && pane_label="${_p} panes"
+            IFS='|' read -r _s _w _wn _p _att _st <<< "$first_line"
             local badge=$(format_status_badge "$_st")
-            local trunc_wn=$(truncate_pad "$_wn" 18)
+            local trunc_wn="${trunc_names[${cur_indices[0]}]}"
             printf "  \033[1m%-18s\033[0m  %s  %-10s%s  %b\n" "${session}:${_w}" "$trunc_wn" "$_att" "$ssh_label" "$badge"
         else
             local expanded=false
@@ -184,26 +260,24 @@ get_grouped_list() {
             [ "$s_done" -gt 0 ] && summary="${summary}\033[1;32m✓${s_done}\033[0m "
 
             local win_label="${win_count} wins"
-
             local indicator="▶"
             $expanded && indicator="▼"
 
             printf "\033[1m%s %s\033[0m  (%s)  %b %s%s\n" "$indicator" "$session" "$win_label" "$summary" "$first_attached" "$ssh_label"
 
             if $expanded; then
-                while IFS='|' read -r _s _w _wn _p _att _st; do
-                    local pane_label="${_p} pane"
-                    [ "$_p" -gt 1 ] && pane_label="${_p} panes"
+                local idx=0
+                for _line in "${cur_lines[@]}"; do
+                    IFS='|' read -r _s _w _wn _p _att _st <<< "$_line"
                     local badge=$(format_status_badge "$_st")
-                    local trunc_wn=$(truncate_pad "$_wn" 18)
+                    local trunc_wn="${trunc_names[${cur_indices[$idx]}]}"
                     printf "    \033[0;37m%-18s\033[0m  %s  %b\n" "${session}:${_w}" "$trunc_wn" "$badge"
-                done < "$tmp_dir/cur_windows"
+                    idx=$((idx + 1))
+                done
             fi
         fi
     done < "$tmp_dir/sessions"
 
-    echo ""
-    printf "\033[1;36m h/l: collapse/expand | H/L: all | Ctrl-R: reset | Enter: select \033[0m\n"
 }
 
 # Handle --list flag (used by fzf reload)
@@ -218,36 +292,6 @@ if [ "$1" = "--no-fzf" ]; then
     exit 0
 fi
 
-# Handle --expand <session>
-if [ "$1" = "--expand" ] && [ -n "$2" ]; then
-    mkdir -p "$(dirname "$STATE_FILE")"
-    if ! grep -qxF "$2" "$STATE_FILE" 2>/dev/null; then
-        echo "$2" >> "$STATE_FILE"
-    fi
-    exit 0
-fi
-
-# Handle --collapse <session>
-if [ "$1" = "--collapse" ] && [ -n "$2" ]; then
-    if [ -f "$STATE_FILE" ]; then
-        grep -vxF "$2" "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null
-        mv "$STATE_FILE.tmp" "$STATE_FILE"
-    fi
-    exit 0
-fi
-
-# Handle --expand-all
-if [ "$1" = "--expand-all" ]; then
-    mkdir -p "$(dirname "$STATE_FILE")"
-    tmux list-windows -a -F "#{session_name}" 2>/dev/null | sort | uniq -d > "$STATE_FILE"
-    exit 0
-fi
-
-# Handle --collapse-all
-if [ "$1" = "--collapse-all" ]; then
-    > "$STATE_FILE"
-    exit 0
-fi
 
 # Function to perform full reset
 perform_full_reset() {
@@ -281,23 +325,18 @@ if [ "$1" = "--reset" ]; then
     exit 0
 fi
 
-# Initialize state: start expanded
-tmux list-windows -a -F "#{session_name}" 2>/dev/null | sort | uniq -d > "$STATE_FILE"
-
 # Main: launch fzf
 ME="$0"
 selected=$(get_grouped_list | fzf \
     --ansi \
     --no-sort \
-    --header="h/l: collapse/expand | H/L: all | Enter: select | Ctrl-R: reset" \
+    --header="Ctrl-J/K: navigate | Enter: select | Ctrl-R: reset" \
     --preview '
         line={}
         target=""
         clean=$(echo "$line" | sed "s/$(printf "\033")\[[0-9;]*m//g")
-        # Extract session:window pattern from the line
         target=$(echo "$clean" | grep -oE "[a-zA-Z0-9_-]+:[0-9]+" | head -1)
         if [ -z "$target" ]; then
-            # Session header line (▶/▼ session): use first window
             first=$(echo "$clean" | awk "{print \$1}")
             if [ "$first" = "▶" ] || [ "$first" = "▼" ]; then
                 sess=$(echo "$clean" | awk "{print \$2}")
@@ -312,17 +351,10 @@ selected=$(get_grouped_list | fzf \
     ' \
     --preview-window=right:50% \
     --prompt="Window> " \
-    --bind="j:down,k:up,ctrl-j:preview-down,ctrl-k:preview-up" \
+    --bind="ctrl-j:down,ctrl-k:up" \
     --bind="ctrl-r:reload(bash '$ME' --reset)" \
-    --bind='l:execute-silent(clean=$(echo {} | sed "s/$(printf "\033")\[[0-9;]*m//g"); first=$(echo "$clean" | awk "{print \$1}"); if [ "$first" = "▶" ]; then sess=$(echo "$clean" | awk "{print \$2}"); bash '"'$ME'"' --expand "$sess"; fi)+reload(bash '"'$ME'"' --list)' \
-    --bind='h:execute-silent(clean=$(echo {} | sed "s/$(printf "\033")\[[0-9;]*m//g"); first=$(echo "$clean" | awk "{print \$1}"); if [ "$first" = "▼" ]; then sess=$(echo "$clean" | awk "{print \$2}"); bash '"'$ME'"' --collapse "$sess"; else t=$(echo "$clean" | awk "{print \$1}"); s=${t%%:*}; bash '"'$ME'"' --collapse "$s"; fi)+reload(bash '"'$ME'"' --list)' \
-    --bind='L:execute-silent(bash '"'$ME'"' --expand-all)+reload(bash '"'$ME'"' --list)' \
-    --bind='H:execute-silent(bash '"'$ME'"' --collapse-all)+reload(bash '"'$ME'"' --list)' \
     --layout=reverse \
     --info=inline)
-
-# Clean up state file
-rm -f "$STATE_FILE"
 
 # Switch to selected target
 if [ -n "$selected" ]; then

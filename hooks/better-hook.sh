@@ -127,6 +127,8 @@ PYEOF
                 TOOL_NAME=$(echo "$JSON_INPUT" | grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"tool_name"[[:space:]]*:[[:space:]]*"//;s/"//')
                 if [ "$TOOL_NAME" = "AskUserQuestion" ]; then
                     write_status "ask"
+                    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+                    "$SCRIPT_DIR/../scripts/play-sound.sh" ask 2>/dev/null &
                 else
                     write_status "working"
                 fi
@@ -137,9 +139,12 @@ PYEOF
                 try_rename_window
                 ;;
             "Notification")
-                write_status "done"
-                SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-                "$SCRIPT_DIR/../scripts/play-sound.sh" 2>/dev/null &
+                CURRENT=$(cat "$STATUS_FILE" 2>/dev/null)
+                if [ "$CURRENT" != "wait" ] && [ "$CURRENT" != "ask" ]; then
+                    write_status "done"
+                    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+                    "$SCRIPT_DIR/../scripts/play-sound.sh" 2>/dev/null &
+                fi
                 ;;
             "PermissionRequest")
                 write_status "wait"

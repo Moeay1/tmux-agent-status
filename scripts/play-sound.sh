@@ -20,6 +20,9 @@ SOUND_TYPE="${1:-done}"
 if [ "$SOUND_TYPE" = "wait" ]; then
     SOUND_CHOICE=$(tmux show-option -gqv @agent-wait-sound 2>/dev/null)
     : "${SOUND_CHOICE:=alert}"
+elif [ "$SOUND_TYPE" = "ask" ]; then
+    SOUND_CHOICE=$(tmux show-option -gqv @agent-ask-sound 2>/dev/null)
+    : "${SOUND_CHOICE:=chime}"
 else
     SOUND_CHOICE=$(tmux show-option -gqv @agent-notification-sound 2>/dev/null)
     [ -z "$SOUND_CHOICE" ] && SOUND_CHOICE=$(tmux show-option -gqv @claude-notification-sound 2>/dev/null)
@@ -28,9 +31,37 @@ fi
 
 case "$SOUND_CHOICE" in
     none)
-        exit 0
+        # Still show notification even if sound is disabled
         ;;
 esac
+
+# Desktop notification (optional, requires terminal-notifier on macOS: brew install terminal-notifier)
+NOTIFY_ENABLED=$(tmux show-option -gqv @agent-notification-popup 2>/dev/null)
+: "${NOTIFY_ENABLED:=on}"
+if [ "$NOTIFY_ENABLED" != "off" ]; then
+    TMUX_TARGET="${TMUX_PANE:+-t $TMUX_PANE}"
+    SESSION_NAME=$(tmux display-message -p $TMUX_TARGET '#{session_name}' 2>/dev/null)
+    WINDOW_INDEX=$(tmux display-message -p $TMUX_TARGET '#{window_index}' 2>/dev/null)
+    WINDOW_NAME=$(tmux display-message -p $TMUX_TARGET '#{window_name}' 2>/dev/null)
+    if [ "$SOUND_TYPE" = "wait" ]; then
+        NOTIFY_TITLE="Agent needs permission"
+    elif [ "$SOUND_TYPE" = "ask" ]; then
+        NOTIFY_TITLE="Agent is asking a question"
+    else
+        NOTIFY_TITLE="Agent finished"
+    fi
+    NOTIFY_MSG="${SESSION_NAME}:${WINDOW_INDEX} ${WINDOW_NAME}"
+    TMUX_BIN=$(command -v tmux)
+    SWITCH_CMD="$TMUX_BIN switch-client -t '${SESSION_NAME}:${WINDOW_INDEX}'"
+
+    if command -v terminal-notifier >/dev/null 2>&1; then
+        terminal-notifier -title "$NOTIFY_TITLE" -message "$NOTIFY_MSG" -group "tmux-agent-status-${SESSION_NAME}-${WINDOW_INDEX}" -execute "$SWITCH_CMD" 2>/dev/null &
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "$NOTIFY_TITLE" "$NOTIFY_MSG" 2>/dev/null &
+    fi
+fi
+
+[ "$SOUND_CHOICE" = "none" ] && exit 0
 
 # Map choice to sound files
 # Bundled sounds live in $PLUGIN_DIR/sounds/; system sounds used as fallback

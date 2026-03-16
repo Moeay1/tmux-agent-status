@@ -104,6 +104,11 @@ format_status_badge() {
 
 # Build the grouped list using temp files (bash 3.2 compatible)
 get_grouped_list() {
+    # Get current window for marking
+    local cur_sess cur_win
+    cur_sess=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+    cur_win=$(tmux display-message -p '#{window_index}' 2>/dev/null)
+
     local tmp_dir
     tmp_dir=$(mktemp -d)
     trap "rm -rf '$tmp_dir'" RETURN
@@ -248,7 +253,9 @@ get_grouped_list() {
             IFS='|' read -r _s _w _wn _p _att _st <<< "$first_line"
             local badge=$(format_status_badge "$_st")
             local trunc_wn="${trunc_names[${cur_indices[0]}]}"
-            printf "  \033[1m%-18s\033[0m  %s  %-10s%s  %b\n" "${session}:${_w}" "$trunc_wn" "$_att" "$ssh_label" "$badge"
+            local marker="  "
+            [ "$session" = "$cur_sess" ] && [ "$_w" = "$cur_win" ] && marker="\033[1;33m▸ \033[0m"
+            printf "%b\033[1m%-18s\033[0m  %s  %-10s%s  %b\n" "$marker" "${session}:${_w}" "$trunc_wn" "$_att" "$ssh_label" "$badge"
         else
             local expanded=false
             is_session_expanded "$session" && expanded=true
@@ -271,7 +278,9 @@ get_grouped_list() {
                     IFS='|' read -r _s _w _wn _p _att _st <<< "$_line"
                     local badge=$(format_status_badge "$_st")
                     local trunc_wn="${trunc_names[${cur_indices[$idx]}]}"
-                    printf "    \033[0;37m%-18s\033[0m  %s  %b\n" "${session}:${_w}" "$trunc_wn" "$badge"
+                    local marker="    "
+                    [ "$session" = "$cur_sess" ] && [ "$_w" = "$cur_win" ] && marker=" \033[1;33m▸\033[0m  "
+                    printf "%b\033[0;37m%-18s\033[0m  %s  %b\n" "$marker" "${session}:${_w}" "$trunc_wn" "$badge"
                     idx=$((idx + 1))
                 done
             fi

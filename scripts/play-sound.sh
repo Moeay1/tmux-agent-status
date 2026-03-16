@@ -52,7 +52,8 @@ if [ "$NOTIFY_ENABLED" != "off" ]; then
     fi
     NOTIFY_MSG="${SESSION_NAME}:${WINDOW_INDEX} ${WINDOW_NAME}"
     TMUX_BIN=$(command -v tmux)
-    SWITCH_CMD="$TMUX_BIN switch-client -t '${SESSION_NAME}:${WINDOW_INDEX}'"
+    # open the terminal app (whatever it is) then switch to the window
+    SWITCH_CMD="open -a '${TERM_PROGRAM:-Terminal}'; $TMUX_BIN switch-client -t '${SESSION_NAME}:${WINDOW_INDEX}'"
 
     if command -v terminal-notifier >/dev/null 2>&1; then
         terminal-notifier -title "$NOTIFY_TITLE" -message "$NOTIFY_MSG" -group "tmux-agent-status-${SESSION_NAME}-${WINDOW_INDEX}" -execute "$SWITCH_CMD" 2>/dev/null &

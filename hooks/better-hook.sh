@@ -52,7 +52,12 @@ if [ -n "$TMUX" ] || [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_TTY" ]; then
         # Helper: auto-rename tmux window based on Claude session info
         try_rename_window() {
             NAME_CACHE="$STATUS_DIR/${TMUX_SESSION}__w${TMUX_WINDOW}.name"
-            # Check cache: skip if name was already set and hasn't changed
+            # Throttle: skip if renamed within last 30 seconds
+            if [ -f "$NAME_CACHE" ]; then
+                local cache_age
+                cache_age=$(( $(date +%s) - $(stat -f %m "$NAME_CACHE" 2>/dev/null || stat -c %Y "$NAME_CACHE" 2>/dev/null || echo 0) ))
+                [ "$cache_age" -lt 30 ] && return
+            fi
             TRANSCRIPT=$(echo "$JSON_INPUT" | grep -o '"transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"//;s/"//')
             SESSION_ID=$(echo "$JSON_INPUT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"//;s/"//')
             [ -z "$TRANSCRIPT" ] || [ -z "$SESSION_ID" ] && return

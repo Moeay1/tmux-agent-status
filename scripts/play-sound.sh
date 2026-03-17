@@ -71,6 +71,7 @@ fi
 # Bundled sounds live in $PLUGIN_DIR/sounds/; system sounds used as fallback
 case "$SOUND_CHOICE" in
     alert)
+        BUNDLED_SOUND="$PLUGIN_DIR/sounds/gong.wav"
         LINUX_SOUND="/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
         MAC_SOUND="Basso.aiff"
         ;;

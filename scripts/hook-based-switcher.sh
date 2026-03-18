@@ -6,6 +6,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATUS_DIR="$HOME/.cache/tmux-agent-status"
 STATE_FILE="$STATUS_DIR/.switcher-expanded"
+FILTER_FILE="$STATUS_DIR/.switcher-agents-only"
 
 # Key helper functions
 key_session() { echo "${1%__w*}"; }
@@ -108,6 +109,10 @@ get_grouped_list() {
     local cur_sess cur_win
     cur_sess=$(tmux display-message -p '#{session_name}' 2>/dev/null)
     cur_win=$(tmux display-message -p '#{window_index}' 2>/dev/null)
+
+    # Check if agents-only filter is active
+    local agents_only=false
+    [ -f "$FILTER_FILE" ] && agents_only=true
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
@@ -249,14 +254,25 @@ get_grouped_list() {
         local ssh_label=""
         is_ssh_cached "$session" && ssh_label=" [ssh]"
 
+        # Skip sessions with no agents in agents-only mode
+        local session_has_agent=false
+        [ "$s_working" -gt 0 ] || [ "$s_wait" -gt 0 ] || [ "$s_ask" -gt 0 ] || [ "$s_done" -gt 0 ] && session_has_agent=true
+
         if [ "$win_count" -eq 1 ]; then
             IFS='|' read -r _s _w _wn _p _att _st <<< "$first_line"
+            if $agents_only && [ -z "$_st" ]; then
+                continue
+            fi
             local badge=$(format_status_badge "$_st")
             local trunc_wn="${trunc_names[${cur_indices[0]}]}"
             local marker="  "
             [ "$session" = "$cur_sess" ] && [ "$_w" = "$cur_win" ] && marker="\033[1;33m▸ \033[0m"
             printf "%b\033[1m%-18s\033[0m  %s  %-10s%s  %b\n" "$marker" "${session}:${_w}" "$trunc_wn" "$_att" "$ssh_label" "$badge"
         else
+            if $agents_only && ! $session_has_agent; then
+                continue
+            fi
+
             local expanded=false
             is_session_expanded "$session" && expanded=true
 
@@ -276,6 +292,10 @@ get_grouped_list() {
                 local idx=0
                 for _line in "${cur_lines[@]}"; do
                     IFS='|' read -r _s _w _wn _p _att _st <<< "$_line"
+                    if $agents_only && [ -z "$_st" ]; then
+                        idx=$((idx + 1))
+                        continue
+                    fi
                     local badge=$(format_status_badge "$_st")
                     local trunc_wn="${trunc_names[${cur_indices[$idx]}]}"
                     local marker="    "
@@ -301,6 +321,15 @@ if [ "$1" = "--no-fzf" ]; then
     exit 0
 fi
 
+# Handle --toggle-filter flag
+if [ "$1" = "--toggle-filter" ]; then
+    if [ -f "$FILTER_FILE" ]; then
+        rm -f "$FILTER_FILE"
+    else
+        touch "$FILTER_FILE"
+    fi
+    exit 0
+fi
 
 # Function to perform full reset
 perform_full_reset() {
@@ -334,12 +363,13 @@ if [ "$1" = "--reset" ]; then
     exit 0
 fi
 
-# Main: launch fzf
+# Main: default to agents-only
+touch "$FILTER_FILE"
 ME="$0"
 selected=$(get_grouped_list | fzf \
     --ansi \
     --no-sort \
-    --header="Ctrl-J/K: navigate | Enter: select | Ctrl-R: reset" \
+    --header="Ctrl-J/K: navigate | Tab: show all | Enter: select | Ctrl-R: reset" \
     --preview '
         line={}
         target=""
@@ -362,6 +392,7 @@ selected=$(get_grouped_list | fzf \
     --prompt="Window> " \
     --bind="ctrl-j:down,ctrl-k:up" \
     --bind="ctrl-r:reload(bash '$ME' --reset)" \
+    --bind="tab:execute-silent(bash '$ME' --toggle-filter)+reload(bash '$ME' --list)" \
     --layout=reverse \
     --info=inline)
 
